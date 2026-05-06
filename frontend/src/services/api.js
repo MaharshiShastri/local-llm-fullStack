@@ -66,6 +66,11 @@ API.interceptors.response.use(
             window.location.reload();
         }
         return Promise.reject(error);
+        if (error.response?.status === 403) {
+            const reason = error.response.data.classify_failure || "Security validation failed.";
+            alert(`Action Blocked: ${reason}`); // Display the classify_failure message
+        }
+        return Promise.reject(error);
     }
 );
 
@@ -74,11 +79,6 @@ export const dashBoard = {
 };
 
 export const aiService = {
-    //unified gateway
-    runAgent: (message, timeBudget, onEvent) => {
-        return fetchStream("/agent/run", {message, time_budget: timeBudget}, onEvent);
-    },
-
     // Stream plans
     streamPlan: (task, time_budget, conversationid, mode,  onChunk) => {
         const id = conversationid ? parseInt(conversationid) : null;
@@ -113,10 +113,13 @@ export const aiService = {
         return API.patch(`/execute/${missionId}/approve`, {
             step_id: stepId,
             status: status,
-            content: content
+            refined_artifact: content
         });
     },
-
+    getExecutionStatus: (taskId) => API.get(`/execute/status/${taskId}`),
+    cancelExecution: (taskId) => {
+        return API.post(`/execute/cancel/${taskId}`);
+    },
     getMemories: () => API.get("/memories"),
     addMemory: (memoryData) => API.post("/memory", memoryData),
     deleteMemory: (memoryId) => API.delete(`/memory/${memoryId}`),
