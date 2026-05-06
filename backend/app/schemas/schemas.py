@@ -1,12 +1,14 @@
 from pydantic import BaseModel, EmailStr, Field, AliasChoices
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 class ChatRequest(BaseModel):
     message: str
     conversation_id: Optional[int] = None
-
+    
 class ChatResponse(BaseModel):
-    response: str
+    action: str="INITIATE_CHAT"
+    payload: str
+    meta: Dict[str, Any] = {}
 
 class UserAuth(BaseModel):
     email: str
@@ -18,28 +20,30 @@ class PlanRequest(BaseModel):
     mode: str="fast" #Fast is default mode, otherwise deep
     conversation_id: Optional[int] = None
 
-class PlanStep(BaseModel):
-    step: str = Field(validation_alias=AliasChoices('step', 'name', 'description'))
-    time_allocated: int
-
-class PlanResponse(BaseModel):
-    plan: list[PlanStep]
-    total_time: int
-
 class StatusUpdate(BaseModel):
     status: str
+
 class MemoryCreate(BaseModel):
     fact_key: str
     fact_value: str
     importance: Optional[int] = 1   
     category: Optional[str] = "general"
 
-class AgentState(BaseModel):
-    mission_id: Optional[int] = None
-    goal: str
-    current_step_index: int = 0
-    steps: List[Dict[str, Any]] = []
-    memories: List[str] = []
-    tool_outputs: Dict[str, Any] = []
-    critic_feedback: Optional[str] = None
-    status: str = "init" # init | planning | validating | executing | completed
+class TaskStep(BaseModel):
+    step: str
+    time_allocated: int
+    tool_required: str #Options: "web_search" and "code_execution" for testing 
+    logic_reasoning: str #xAI turns black box AI to understandable AI
+
+class AgentStatePlan(BaseModel):
+    objective: str
+    total_budget: int
+    steps: List[TaskStep]
+    strategy_recommendation: str
+
+class StepApprovalRequest(BaseModel):
+    step_id: str
+    status: str = "approved"
+    description: Optional[str] = None
+    #tool_required: Optional[str] = None # Optional: if you want to allow switching tools too for future updates
+    
