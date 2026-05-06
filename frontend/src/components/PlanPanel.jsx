@@ -127,6 +127,14 @@ const PlanPanel = ({ onBack, input, setInput, onMetricsUpdate, activePlan, onCom
           const idx = data.index ?? 0;
           console.log("MOVING_TO_STEP:", data.index);
           setCurrentStep(idx);
+          setSteps(prev => prev.map((s, i) => 
+          i === idx ?{
+            ...s,
+            tool_required: data.steps?.[idx]?.tool_required || s.tool_required,
+            logic_reasoning: data.steps?.[idx]?.logic_reasoning || s.logic_reasoning
+
+          } : s
+        ));
           const duration = data.steps?.[idx]?.time_allocated || steps[idx]?.time_allocated || 60;
           setTimeLeft(duration);
           setTotalStepTime(duration);
@@ -139,12 +147,12 @@ const PlanPanel = ({ onBack, input, setInput, onMetricsUpdate, activePlan, onCom
           setApprovalData({
             step_id: data.step_id || data.backend_step_id, 
             index: data.index,
-            artifact: data.content?.artifact || "",
+            artifact: data.content?.description || "",
             estimated: steps[data.index]?.time_allocated || 0,
             actual: data.content?.time_needed || 0,
             drift: data.content?.drift || 0
           });
-          setEditableArtifact(data.content?.artifact || "");
+          setEditableArtifact(data.content?.description || "");
           break;
 
         case "STEP_COMPLETED":
@@ -159,18 +167,7 @@ const PlanPanel = ({ onBack, input, setInput, onMetricsUpdate, activePlan, onCom
           setSteps([]);
           onMetricsUpdate(prev => ({ ...prev, status: 'STREAMS_READY', progress: 'DONE' }));
           break;
-        
-        case "STRATEGIC_INTERRUPT":
-          setIsPaused(true);
-          setApprovalData({
-            step_id: data.step_id,
-            type: "CLARIFICATION",
-            reason: data.reason,
-            isStrategic: true // Flag to style it differently in the UI
-          });
-          onMetricsUpdate(prev => ({ ...prev, status: 'AWAITING_CLARIFICATION' }));
-          break;
-        
+      
         case "TELEMETRY_PULSE":
           setLiveMetrics(data.metrics);
           onMetricsUpdate({
@@ -319,102 +316,128 @@ const PlanPanel = ({ onBack, input, setInput, onMetricsUpdate, activePlan, onCom
       )}
 
       {/* STATE 3: EXECUTING */}
-      {status === 'executing' && (
-        <div className="flex-1 flex flex-col min-h-0 overflow-hidden h-full animate-in slide-in-from-right-4 duration-500">
-          <div className="p-6 border-b border-slate-800/60 flex justify-between items-center bg-slate-900/40 shrink-0">
-            <div className="flex items-center gap-5">
-              <div className="relative w-14 h-14">
-                <svg className="w-full h-full -rotate-90">
-                  <circle cx="28" cy="28" r="24" stroke="currentColor" strokeWidth="3" fill="transparent" className="text-slate-800" />
-                  <circle cx="28" cy="28" r="24" stroke="currentColor" strokeWidth="3" fill="transparent" strokeDasharray="150.8" strokeDashoffset={150.8 - (150.8 * progress) / 100} className={`${isPaused ? 'text-orange-500' : 'text-cyan-500'} transition-all duration-1000 shadow-[0_0_10px_rgba(6,182,212,0.5)]`} />
-                </svg>
-                <span className="absolute inset-0 flex items-center justify-center text-[10px] font-black font-mono">{timeLeft}S</span>
+      {/* STATE 3: EXECUTING */}
+{status === 'executing' && (
+  <div className="flex-1 flex flex-col min-h-0 overflow-hidden h-full animate-in slide-in-from-right-4 duration-500">
+    <div className="p-6 border-b border-slate-800/60 flex justify-between items-center bg-slate-900/40 shrink-0">
+      <div className="flex items-center gap-5">
+        <div className="relative w-14 h-14">
+          <svg className="w-full h-full -rotate-90">
+            <circle cx="28" cy="28" r="24" stroke="currentColor" strokeWidth="3" fill="transparent" className="text-slate-800" />
+            <circle cx="28" cy="28" r="24" stroke="currentColor" strokeWidth="3" fill="transparent" strokeDasharray="150.8" strokeDashoffset={150.8 - (150.8 * progress) / 100} className={`${isPaused ? 'text-orange-500' : 'text-cyan-500'} transition-all duration-1000 shadow-[0_0_10px_rgba(6,182,212,0.5)]`} />
+          </svg>
+          <span className="absolute inset-0 flex items-center justify-center text-[10px] font-black font-mono">{timeLeft}S</span>
+        </div>
+        <div>
+          <h2 className={`text-[9px] font-black uppercase tracking-[0.2em] ${isPaused ? 'text-orange-500' : 'text-cyan-500'}`}>
+            {isPaused ? 'Protocol_Interrupt' : 'Neural_Execution'}
+          </h2>
+          <p className="text-xl font-black uppercase italic tracking-tighter">
+            Phase {currentStep + 1} <span className="text-slate-700">/ {displayTotal}</span>
+          </p>
+        </div>
+      </div>
+      {timeLeft === 0 && !isPaused && (
+        <button onClick={() => initiateProtocol(activeMissionId || activePlan?.mission_id)} className="px-8 py-3 bg-cyan-500 text-black text-[10px] font-black uppercase rounded-xl hover:scale-105 transition-transform shadow-[0_0_20px_rgba(6,182,212,0.3)]">
+          {isPaused ? 'Resume_Agent' : 'Launch_Agent'}
+        </button>
+      )}
+    </div>
+
+    <div className="flex-1 overflow-y-auto p-6 space-y-4 custom-scrollbar min-h-0">
+      {steps.map((s, idx) => {
+        const isComp = idx < currentStep || s.status === 'completed';
+        const isAct = idx === currentStep;
+        const isClarification = isAct && approvalData?.type === "CLARIFICATION";
+
+        return (
+          <div key={idx} className={`p-5 rounded-2xl border transition-all duration-700 ${
+            isAct 
+              ? isClarification 
+                ? 'bg-orange-500/5 border-orange-500/40 shadow-[0_0_30_px_rgba(249,115,22,0.05)]' 
+                : 'bg-slate-800/40 border-cyan-500/40 shadow-[0_0_30px_rgba(56,189,248,0.1)]' 
+              : 'border-slate-800/50 opacity-30 grayscale'
+          }`}>
+            <div className="flex gap-4">
+              <div className="pt-1">
+                {isComp ? <CheckCircle2 size={20} className="text-emerald-500" /> : <Circle size={20} className={isAct ? (isClarification ? "text-orange-500 animate-pulse" : "text-cyan-500 animate-pulse") : "text-slate-800"} />}
               </div>
-              <div>
-                <h2 className={`text-[9px] font-black uppercase tracking-[0.2em] ${isPaused ? 'text-orange-500' : 'text-cyan-500'}`}>
-                  {isPaused ? 'Protocol_Interrupt' : 'Neural_Execution'}
-                </h2>
-                <p className="text-xl font-black uppercase italic tracking-tighter">
-                  Phase {currentStep + 1} <span className="text-slate-700">/ {displayTotal}</span>
+              <div className="flex-1">
+                {/* STEP DESCRIPTION */}
+                <p className={`text-xs font-black uppercase tracking-tight mb-3 ${isAct ? 'text-slate-100' : 'text-slate-500'}`}>
+                  {s.description}
                 </p>
-              </div>
-            </div>
-            {timeLeft === 0 && !isPaused && (
-              <button onClick={() => initiateProtocol(activeMissionId || activePlan?.mission_id)} className="px-8 py-3 bg-cyan-500 text-black text-[10px] font-black uppercase rounded-xl hover:scale-105 transition-transform shadow-[0_0_20px_rgba(6,182,212,0.3)]">
-                {isPaused ? 'Resume_Agent' : 'Launch_Agent'}
-              </button>
-            )}
-          </div>
 
-          <div className="flex-1 overflow-y-auto p-6 space-y-4 custom-scrollbar min-h-0">
-            {steps.map((s, idx) => {
-              const isComp = idx < currentStep || s.status === 'completed';
-              const isAct = idx === currentStep;
-              const isClarification = isAct && approvalData?.type === "CLARIFICATION";
-
-              return (
-                <div key={idx} className={`p-5 rounded-2xl border transition-all duration-700 ${
-                  isAct 
-                    ? isClarification 
-                      ? 'bg-orange-500/5 border-orange-500/40 shadow-[0_0_30px_rgba(249,115,22,0.05)]' 
-                      : 'bg-slate-800/40 border-cyan-500/40 shadow-[0_0_30px_rgba(56,189,248,0.1)]' 
-                    : 'border-slate-800/50 opacity-30 grayscale'
-                }`}>
-                  <div className="flex gap-4">
-                    <div className="pt-1">
-                      {isComp ? <CheckCircle2 size={20} className="text-emerald-500" /> : <Circle size={20} className={isAct ? (isClarification ? "text-orange-500 animate-pulse" : "text-cyan-500 animate-pulse") : "text-slate-800"} />}
+                {/* TOOLS & REASONING (Only visible for active/completed steps for clarity) */}
+                {(isAct || isComp) && (
+                  <div className="mb-4 space-y-2 animate-in fade-in duration-500">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[8px] font-bold text-slate-500 uppercase tracking-widest">Tool required:</span>
+                      <span className="text-[9px] font-mono font-black text-cyan-400 bg-cyan-500/10 px-2 py-0.5 rounded border border-cyan-500/20">
+                        {s.tool_required || 'standard_compute'}
+                      </span>
                     </div>
-                    <div className="flex-1">
-                      <p className={`text-xs font-black uppercase tracking-tight ${isAct ? 'text-slate-100' : 'text-slate-500'}`}>{s.description}</p>
-                      
-                      {isAct && approvalData && (
-                        <div className="mt-5 space-y-4 animate-in fade-in slide-in-from-top-2 duration-400">
-                          <div className="flex items-center gap-2">
-                             <span className={`text-[9px] font-black px-2 py-0.5 rounded tracking-tighter ${isClarification ? 'bg-orange-500 text-black' : 'bg-cyan-500 text-black'}`}>
-                               {isClarification ? 'ACTION_REQUIRED: AMBIGUITY_DETECTED' : 'ARTIFACT_VERIFICATION'}
-                             </span>
-                          </div>
+                    
+                    {s.logic_reasoning && (
+                      <div className="space-y-1">
+                        <span className="text-[8px] font-bold text-slate-500 uppercase tracking-widest">Reason:</span>
+                        <p className="text-[10px] text-slate-400 font-mono leading-relaxed italic bg-black/20 p-2 rounded-lg border border-slate-800/50">
+                          {s.logic_reasoning}
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                )}
+                
+                {/* INTERACTION AREA (APPROVALS / CLARIFICATIONS) */}
+                {isAct && approvalData && (
+                  <div className="mt-5 space-y-4 animate-in fade-in slide-in-from-top-2 duration-400">
+                    <div className="flex items-center gap-2">
+                       <span className={`text-[9px] font-black px-2 py-0.5 rounded tracking-tighter ${isClarification ? 'bg-orange-500 text-black' : 'bg-cyan-500 text-black'}`}>
+                         {isClarification ? 'ACTION_REQUIRED: AMBIGUITY_DETECTED' : 'ARTIFACT_VERIFICATION'}
+                       </span>
+                    </div>
 
-                          {approvalData.reason && (
-                            <div className="p-3 bg-orange-500/10 border-l-2 border-orange-500 rounded-r-lg">
-                              <p className="text-[10px] text-orange-400 font-mono italic leading-relaxed">
-                                &gt; {approvalData.reason}
-                              </p>
-                            </div>
-                          )}
+                    {approvalData.reason && (
+                      <div className="p-3 bg-orange-500/10 border-l-2 border-orange-500 rounded-r-lg">
+                        <p className="text-[10px] text-orange-400 font-mono italic leading-relaxed">
+                          &gt; {approvalData.reason}
+                        </p>
+                      </div>
+                    )}
 
-                          <textarea 
-                            value={editableArtifact} 
-                            onChange={(e) => setEditableArtifact(e.target.value)} 
-                            className={`w-full bg-black/60 border rounded-xl p-4 text-[11px] font-mono min-h-[140px] text-slate-200 outline-none transition-all custom-scrollbar ${
-                              isClarification ? 'border-orange-500/30 focus:border-orange-500' : 'border-slate-700 focus:border-cyan-500'
-                            }`} 
-                          />
-                          
-                          <div className="flex gap-3">
-                            {!isClarification && (
-                              <button onClick={() => handleApproval('refine')} className="flex-1 py-3 bg-slate-800 hover:bg-slate-700 text-[10px] font-black uppercase rounded-xl transition-colors text-slate-300">Refine</button>
-                            )}
-                            <button 
-                              onClick={() => handleApproval('approve')} 
-                              className={`flex-[2] py-3 text-black text-[10px] font-black uppercase rounded-xl transition-all shadow-lg ${
-                                isClarification ? 'bg-orange-500 hover:bg-orange-400' : 'bg-emerald-500 hover:bg-emerald-400'
-                              }`}
-                            >
-                              {isClarification ? 'Confirm_Clarification' : 'Approve_and_Proceed'}
-                            </button>
-                          </div>
-                        </div>
+                    <textarea 
+                      value={editableArtifact} 
+                      onChange={(e) => setEditableArtifact(e.target.value)} 
+                      className={`w-full bg-black/60 border rounded-xl p-4 text-[11px] font-mono min-h-[140px] text-slate-200 outline-none transition-all custom-scrollbar ${
+                        isClarification ? 'border-orange-500/30 focus:border-orange-500' : 'border-slate-700 focus:border-cyan-500'
+                      }`} 
+                    />
+                    
+                    <div className="flex gap-3">
+                      {!isClarification && (
+                        <button onClick={() => handleApproval('refine')} className="flex-1 py-3 bg-slate-800 hover:bg-slate-700 text-[10px] font-black uppercase rounded-xl transition-colors text-slate-300">Refine</button>
                       )}
+                      <button 
+                        onClick={() => handleApproval('approve')} 
+                        className={`flex-[2] py-3 text-black text-[10px] font-black uppercase rounded-xl transition-all shadow-lg ${
+                          isClarification ? 'bg-orange-500 hover:bg-orange-400' : 'bg-emerald-500 hover:bg-emerald-400'
+                        }`}
+                      >
+                        {isClarification ? 'Confirm_Clarification' : 'Approve_and_Proceed'}
+                      </button>
                     </div>
                   </div>
-                </div>
-              );
-            })}
-            <div className="h-20 shrink-0 w-full" />
+                )}
+              </div>
+            </div>
           </div>
-        </div>
-      )}
+        );
+      })}
+      <div className="h-20 shrink-0 w-full" />
+    </div>
+  </div>
+)}
     </NeumorphicCard>
 
     {/* COMPLETION TOAST */}

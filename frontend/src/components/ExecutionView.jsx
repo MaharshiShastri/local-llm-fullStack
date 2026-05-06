@@ -15,6 +15,9 @@ const ExecutionView = ({ plan, onComplete }) => {
   const [activeMissionId, setActiveMissionId] = useState(null);
   const [editableArtifact, setEditableArtifact] = useState("");
   const [localSteps, setLocalSteps] = useState([]);
+  const [isResuming, setIsResuming] = useState(false);
+const [lastUpdate, setLastUpdate] = useState(Date.now());
+const WORKER_TIMEOUT = 5 * 60 * 1000; // 5 Minutes
 
   // Sync initial plan steps
   useEffect(() => { 
@@ -43,7 +46,124 @@ const ExecutionView = ({ plan, onComplete }) => {
     }
     return () => clearInterval(timer);
   }, [isExecuting, isPaused, timeLeft]);
+  //Polling for celery task status
+  const startExecution = async () => {
+    try{
+      await aiService.executeMission(missionId, (event) => {
+        if (event.celery_task_id) {
+                    setCeleryId(event.celery_task_id);
+                }
+            });
+        } catch (err) {
+            console.error("Execution failed to start", err);
+        }
+    };
 
+    // The Polling Logic
+    useEffect(() => {
+    if (!celeryId || isPaused) return;
+
+    const poll = async () => {
+        try {
+            const { data } = await aiService.getExecutionStatus(celeryId);
+            
+            // Check for worker timeout (Watchdog)
+            if (Date.now() - lastUpdate > WORKER_TIMEOUT) {
+                setStatus("LOST");
+                stopPolling();
+                return;
+            }
+
+            if (data.state !== status) {
+                setLastUpdate(Date.now()); // Reset watchdog on any state change
+                setStatus(data.state);
+            }
+
+            // If we were resuming and the status is now RUNNING, turn off the pulse
+            if (isResuming && data.state === "RUNNING") {
+                setIsResuming(false);
+            }
+
+            if (data.state === "WAITING_FOR_USER") {
+                setApprovalData(data.details);
+                setIsPaused(true);
+                stopPolling();
+            }
+        } catch (err) {
+            console.error("Polling error", err);
+        }
+    };
+
+    const timer = setInterval(poll, 1500);
+    return () => clearInterval(timer);
+}, [celeryId, isPaused, lastUpdate]);
+
+    const stopPolling = () => {
+        if (pollTimer.current) clearInterval(pollTimer.current);
+    };
+
+    const handleResume = async () => {
+        try {
+            await aiService.approveStep(missionId, "completed", approvalData.step_id, userInput);
+            setApprovalData(null);
+            setUserInput("");
+            // Re-start polling once the RESUME signal is sent to Redis
+            setCeleryId(prev => `${prev}_resumed_${Date.now()}`); 
+        } catch (err) {
+            if (err.response?.status === 403) {
+            setSecurityError(err.response.data.classify_failure);
+        }
+    }};
+    useEffect(() => {
+    // 1. On Mount: Check if there's a task left over in storage
+    const savedTaskId = localStorage.getItem('active_mission_task');
+    if (savedTaskId && !celeryId) {
+        setCeleryId(savedTaskId);
+    }
+}, []);
+const handleCancel = async () => {
+    if (!celeryId) return;
+    
+    try {
+        await aiService.cancelExecution(celeryId);
+        stopPolling();
+        localStorage.removeItem('active_mission_task');
+        setCeleryId(null);
+        setStatus("CANCELLED");
+        setApprovalData(null);
+    } catch (err) {
+        console.error("Failed to kill task:", err);
+    }
+};
+useEffect(() => {
+    if (!celeryId) return;
+
+    // 2. Persist the ID whenever it changes
+    localStorage.setItem('active_mission_task', celeryId);
+
+    const poll = async () => {
+        try {
+            const { data } = await aiService.getExecutionStatus(celeryId);
+            setStatus(data.state);
+
+            if (data.state === "WAITING_FOR_USER") {
+                setApprovalData(data.details); 
+                stopPolling(); 
+            }
+
+            // 3. Clear storage when the mission reaches a terminal state
+            if (["SUCCESS", "FAILURE"].includes(data.state)) {
+                localStorage.removeItem('active_mission_task');
+                stopPolling();
+            }
+        } catch (err) {
+            stopPolling();
+        }
+    };
+
+    pollTimer.current = setInterval(poll, 1500);
+    return () => stopPolling();
+}, [celeryId]);
   // --- MISSION CONTROL ---
   const startMission = () => {
   if (!activeMissionId) return;
@@ -93,7 +213,7 @@ const ExecutionView = ({ plan, onComplete }) => {
   }
   const handleApproval = async (decision) => {
     if (!activeMissionId || !approvalData?.step_id) return;
-
+    setisResuming(true);
     try {
       let finalStatus;
       if (approvalData.type === "CLARIFICATION") {
@@ -138,11 +258,23 @@ const ExecutionView = ({ plan, onComplete }) => {
                   </p>
                </div>
             </div>
-            {!isExecuting && !isFinished && (
-              <button onClick={startMission} className="px-6 py-3 bg-cyan-500 rounded-full text-black font-black uppercase text-[10px] hover:bg-cyan-400 transition-colors">
-                Initiate_Protocol
-              </button>
-            )}
+            <div className="flex gap-3">
+                {/* KILL SWITCH - Only shows when active/paused */}
+                {(isExecuting || isPaused) && !isFinished && (
+                    <button 
+                        onClick={handleCancel}
+                        className="px-4 py-3 bg-red-500/10 border border-red-500/50 rounded-full text-red-500 font-black uppercase text-[10px] hover:bg-red-500 hover:text-white transition-all"
+                    >
+                        Terminate
+                    </button>
+                )}
+
+                {!isExecuting && !isFinished && (
+                    <button onClick={startMission} className="px-6 py-3 bg-cyan-500 rounded-full text-black font-black uppercase text-[10px] hover:bg-cyan-400 transition-colors">
+                        Initiate_Protocol
+                    </button>
+                )}
+            </div>
           </div>
         </div>
 
