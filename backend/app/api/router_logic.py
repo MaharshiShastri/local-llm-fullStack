@@ -9,20 +9,23 @@ import os
 import time
 import psutil
 import logging
+import redis
+import concurrent.futures
 
 # Internal Imports (User-defined modules and methods)
 from database import SessionLocal
-from app.schemas.schemas import ChatRequest, ChatResponse, UserAuth, PlanResponse, PlanRequest, StatusUpdate, MemoryCreate
+from app.schemas.schemas import ChatRequest, ChatResponse, UserAuth, StepApprovalRequest, PlanRequest, StatusUpdate, MemoryCreate
 from app.services.ai_service import generate_response, generate_stream, generate_plan
 import app.models.models as models
 from app.core.auth import hash_password, verify_password, create_access_token, SECRET_KEY, ALGORITHM
-from app.services.executor import run_mission_stream, ACTIVE_MISSIONS
 from fastapi.security import OAuth2PasswordBearer
 from app.services import chat_service, task_service
 from app.rag.retriever import rag_retriever
 from app.rag.ingestor import ingest_text, get_grounded_context
 from app.services.memory_service import get_memories, add_memory, delete_memory, update_memory, extract_and_save_memories
 from app.utils.analytics import analytics_engine
+from app.services.task_service import trigger_mission_execution
+from app.services.tasks import celery
 
 api_router = APIRouter()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
@@ -40,6 +43,9 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+r_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
 
 def get_rag_context(query: str, db: Session, time: int):
     try:
@@ -117,6 +123,17 @@ def validate_input(text: str):
     if any (key in text.upper() for key in forbidden_keywords):
         raise HTTPException(status_code=403, detail="Instruction Injection Detected")
     
+def get_active_mission_context(user_id: int, db: Session):
+    active_mission = db.query(models.Tasks).filter(
+        models.Tasks.user_id == user_id,
+        models.Tasks.status == "pending"
+    ).first()
+
+    if active_mission:
+        return f"\n[SYSTEM ALERT: The user has an active mission: '{active_mission.task_name}']\n"
+    return ""
+
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 #End of Helper functions
 
 @api_router.get("/")
@@ -157,6 +174,7 @@ def login(request: UserAuth, db: Session = Depends(get_db)):
 
 #START of Ordinary conversations with AI functions below for web-equivalent CRUD operations
 #Update the conversation with new prompt from user(buffererd response used for very initial testing)
+"""
 @api_router.post("/chat")
 def chat(request: ChatRequest, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     #Check if the conversation is presnet, if not then create a new one
@@ -199,7 +217,8 @@ def chat(request: ChatRequest, db: Session = Depends(get_db), current_user: mode
 
     full_prompt = history_text + f"User: {request.message}\nAssistant:"
     #GEnerate AI reply
-    ai_reply = generate_response(full_prompt)
+    #ai_reply = await queued_llm(generate_response, full_prompt)
+    #ai_reply = generate_response(full_prompt)
 
     #Save AI reply
     ai_msg = models.Message(
@@ -211,7 +230,7 @@ def chat(request: ChatRequest, db: Session = Depends(get_db), current_user: mode
     db.add(ai_msg)
     db.commit()
 
-    return {"response": ai_reply, "conversation_id": conversation.id}
+    return {"response": ai_reply, "conversation_id": conversation.id}"""
 
 #Read opearation of web-equivalent(GET) for all conversations
 @api_router.get("/conversation/{conversation_id}")
@@ -273,6 +292,7 @@ async def chat_stream(request: ChatRequest, db: Session = Depends(get_db), curre
         #print(doc_context[:10])
         if not doc_context and request.message.startswith("@doc"):
             print(classify_failure("RAG_SILENCE", "Query Explicitly requested docs but not found."))
+        mission_context = get_active_mission_context(current_user.id, db)
     except Exception as e:
         return JSONResponse(status_code=500, content=classify_failure("DB_CONTENT", str(e)))
 
@@ -299,7 +319,7 @@ Always cite your sources using [Filename] format.
 
 {doc_context}
 {memory_context}
-
+{mission_context}
 --- RECENT CONVERSATION ---
 {history[-5:]}
 
@@ -310,12 +330,15 @@ Always cite your sources using [Filename] format.
     print(f"Full prompt sent to model:\n{full_prompt}\n--- END OF PROMPT ---")
 
     async def stream_generator():
+        loop = asyncio.get_event_loop()
         ai_response = ""
         try:
             yield f"data: {json.dumps({'conversation_id': conv_id})}\n\n"
-            for token in generate_stream(full_prompt):
+            gen = await loop.run_in_executor(executor, lambda: generate_stream(full_prompt))
+            for token in gen:
                 ai_response += token
                 yield f"data: {json.dumps({'token': token})}\n\n"
+
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
         finally:
@@ -430,11 +453,11 @@ async def create_execution_plan(request: PlanRequest, db: Session = Depends(get_
 
         actual_sum = sum(step.get("time_allocated", 0) for step in steps)
 
-        if actual_sum != total_budget:
-            print(f"Correction Triggered: Budget Mismatch({actual_sum} vs {total_budget})")
-            diff = total_budget - actual_sum
-            if steps:
-                steps[-1]["time_allocated"] += diff
+        if actual_sum > total_budget:
+            # Scale all steps down proportionally instead of just nuking the last one
+            ratio = total_budget / actual_sum
+            for s in steps:
+                s["time_allocated"] = max(10, int(s["time_allocated"] * ratio))
 
         return steps
         
@@ -442,25 +465,29 @@ async def create_execution_plan(request: PlanRequest, db: Session = Depends(get_
     context = get_rag_context(request.task, db, time=request.time_budget)
     
     try:
-        start_time = time.time()
-        for step in generate_plan(request.task, request.time_budget, request.mode, context):
-            if time.time() - start_time > 45:
-                return JSONResponse(status_code=504, content=classify_failure("LLM_TIMEOUT", "Plan Generation exceeded 45s SLA."))
-            
-            if isinstance(step, str):
-                step = {"step": step, "time_allocated": 60}
-            
-            if isinstance(step, dict) and "error" in step:
-                return JSONResponse(status_code=422, content=classify_failure("PLAN_GEN_FAILED", step['error']))
-            
-            raw_steps.append(step)
-            #print(raw_steps)
+        raw_output = await generate_plan(request.task, request.time_budget, request.mode, context)
+        import inspect
+        if inspect.isgenerator(raw_output) or inspect.isasyncgen(raw_output):
+            raw_steps = [step for step in raw_output]
+        elif isinstance(raw_output, str):
+            from app.services.executor import safe_json_parse
+            # Ensure safe_json_parse is awaited if it's async!
+            parsed_data = await safe_json_parse(raw_output, {"steps":[]})
+            raw_steps = parsed_data.get('steps', [])
+        else:
+            raw_steps = raw_output
+
+        # Add a check to ensure we didn't get a nested list or malformed data
+        if raw_steps and isinstance(raw_steps[0], list):
+             raw_steps = raw_steps[0]
 
     except Exception as e:
+        logger.error(f"Plan generation crash: {e}")
         return JSONResponse(status_code=500, content=classify_failure("PLAN_GEN_FAILED", str(e)))
 
     if not raw_steps:
         return JSONResponse(status_code=400, content=classify_failure("PLAN_GEN_FAILED", "Generator returned empty sequence."))
+    
     raw_steps = await validate_and_correct_steps(raw_steps, request.time_budget)
     # 2. SAVE TO DB (Now we have the full list)
     mission_id, enriched = task_service.create_mission_and_steps(
@@ -472,15 +499,10 @@ async def create_execution_plan(request: PlanRequest, db: Session = Depends(get_
         try:
             # First, stream the steps for the "Loading" UI one by one
             for step_object in raw_steps:
-                if len(step_object["step"].split()) < 4 or "???" in step_object["step"]: # Basic heuristic to detect vague steps
-                    step_object["intervention_required"] = True
-                    step_object["reason"] = "Description is too vague for autonomous execution."
-
                 print(f"Streaming step: {step_object}")  # Debug log to see the step being streamed
                 yield f"data: {json.dumps({'single_step': step_object, 'status': 'streaming'})}\n\n"
                 await asyncio.sleep(0.1) # Tiny delay so the UI animation looks smooth
                 
-
             # Finally, send the completion signal with the mission_id
             yield f"data: {json.dumps({
                 'mission_id': mission_id, 
@@ -499,7 +521,7 @@ def update_task_status(task_id: int, data: StatusUpdate, db: Session = Depends(g
     #return a HTTPException
     task = db.query(models.Tasks).filter(
         models.Tasks.user_id == current_user.id,
-        models.Tasks.id == task_id
+        models.Tasks.id == task_id 
     ).first()
 
     if not task:
@@ -533,41 +555,37 @@ async def start_execution(mission_id: int, db: Session = Depends(get_db), curren
             "backend_step_id": s.backend_step_id, # Changed from step_id
             "description": s.description, 
             "time_allocated": s.time_allocated,
-            "status": "pending",
-            "artifact_content": ""
+            "status": s.status,
+            "artifact_content": "",
+            "tool_required": s.tool_required,
+            "reasoning": s.logic_reasoning
         }
         for s in steps
     ]
-    async def event_generator():
-        try:
-            yield f"data: {json.dumps({'event': 'MANIFEST', 'steps': manifest})}\n\n"
+    task_id = trigger_mission_execution(db, mission_id, task.total_time, manifest)
+    return {
+        "status": "QUEUED",
+        "mission_id": mission_id,
+        "celery_task_id": task_id,
+        "message": "Mission execution moved to background worker."
+    }
 
-            async for event in run_mission_stream(mission_id, task.total_time, manifest):
-                yield f"data: {json.dumps(event)}\n\n"
+@api_router.get("execute/status/{task_id}")
+async def get_mission_status(task_id: str):
+    task_result = celery.AsyncResult(task_id)
+    response = {
+        "task_id": task_id,
+        "state": task_result.state, # PENDING, PROGRESS, SUCCESS, FAILURE
+        "progress": task_result.info if task_result.info else {}
+    }
 
-            for item in manifest:
-                db.query(models.TaskStep).filter(
-                        models.TaskStep.task_id == mission_id,
-                        models.TaskStep.backend_step_id == item['backend_step_id']
-                    ).update({
-                        "status": item["status"],
-                        "artifact_content": item["artifact_content"]
-                    })
-            db.commit()
-            yield f"data: {json.dumps({'event': 'DB_SYNC_COMPLETE'})}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'event': 'ERROR', 'detail': str(e)})}\n\n"
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
-
+    return response
 @api_router.patch("/execute/{mission_id}/approve")
-async def approve_mission_step(mission_id: int, data: dict, db: Session = Depends(get_db)):
-    step_id = str(data.get("step_id"))
-    status_to_set = data.get("status", "completed")
-    new_content = data.get("content")
-    
+async def approve_mission_step(mission_id: int, data: StepApprovalRequest, db: Session = Depends(get_db)):
+    step_id = str(data.step_id)
+
     try:
-        validate_input(new_content)
+        validate_input(data.description)
     except Exception as e:
        return JSONResponse(
         status_code=403, 
@@ -581,9 +599,9 @@ async def approve_mission_step(mission_id: int, data: dict, db: Session = Depend
         step_in_memory = next((s for s in manifest if str(s.get('backend_step_id')) == step_id), None)
         
         if step_in_memory:
-            step_in_memory['status'] = status_to_set
-            if new_content:
-                step_in_memory['artifact_content'] = new_content
+            step_in_memory['status'] = data.status
+            if data.description:
+                step_in_memory['description'] = data.description
             
             # 2. ALSO update DB in background so the state is persisted 
             # if the user refreshes the page
@@ -593,15 +611,33 @@ async def approve_mission_step(mission_id: int, data: dict, db: Session = Depend
             ).first()
             
             if step_db:
-                step_db.status = status_to_set
-                if new_content:
-                    step_db.artifact_content = new_content
+                step_db.status = data.status
+                if data.description:
+                    step_db.description = data.description
                 db.commit()
-                
+            r_client.publish(f"mission_control_{mission_id}", "RESUME")
             return {"message": "Memory updated, stream will proceed."}
-
+        
     raise HTTPException(status_code=404, detail="Mission not currently active in memory")
 
+#Kill switch for the Agentic ai
+@api_router.post("/execute/cancel/{task_id}")
+async def cancel_mission_execution(task_id: str):
+    try:
+        # 'terminate=True' sends a SIGTERM to the child process executing the task
+        # 'signal="SIGKILL"' can be used if you want a more forceful shutdown
+        celery.control.revoke(task_id, terminate=True, signal="SIGKILL")
+        
+        return {
+            "status": "success",
+            "message": f"Termination signal sent to task {task_id}",
+            "task_id": task_id
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to issue kill command: {str(e)}"
+        )
 #End of Agentic AI with time-awareness engine conversations with functions below for web-equivalent CRUD operations
 #START of Memory Vault functions for web-equivalent CRUD operations
 @api_router.get("/memories")
@@ -689,29 +725,3 @@ async def archive_logs(mission_id: int, data: dict):
 @api_router.get("/system/stats")
 def get_stats(current_user: models.User = Depends(get_current_user)):
     return analytics_engine.get_system_kpis()
-@api_router.post("/agent/run")
-async def agent_gateway(
-    request: ChatRequest,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-    bg_tasks: BackgroundTasks = BackgroundTasks()
-):
-    result = await workflow.route_and_resolve(request.message, db, current_user.id, time_budget=600)
-
-    if result["type"] == "plan":
-        mission_id, enriched = task_service.create_mission_and_steps(db, current_user.id, 600, result["payload"])
-        return {
-            "action": "INITIATE_PLAN",
-            "mission_id": mission_id,
-            "steps": enriched,
-            "meta": result['meta']
-        }
-
-    if result["type"] == "chat":
-        async def stream_response():
-            prompt = result.get("payload", request.message)
-            async with llm_semaphore:
-                for token in generate_stream(prompt):
-                    yield f"data: {json.dumps({'token': token, 'meta': result['meta']})}\n\n"
-
-        return StreamingResponse(stream_response(), media_type="text/event-stream")
