@@ -46,7 +46,7 @@ def get_strategy_time(total_time):
         return "DEEP_REASONING: Add validation sub-steps, perform exhaustive search, prioritize accuracy."
     return "BALANCED_MODE: Output a clear plan with some validation, but keep it concise and actionable."
 
-def generate_response(prompt) -> str:
+def generate_response(prompt):
     try:
         response = requests.post(
             OLLAMA_URL,
@@ -76,22 +76,33 @@ def generate_response(prompt) -> str:
 def generate_plan(task: str, total_time: int, mode: str, context: str=""):
     # Prompt optimized to force a clear, repeatable structure
     prompt = f"""[INST] <<SYS>>
-You are the STRATEGIC_AI_PLANNER. Decompose the objective into 5-7 chronological steps only.
-GROUND REQUIRMENT: Base steps ONLY on the provided context IF available.
-{f"CONTEXT: {context}" if context else ""}
-STRICT JSON FORMAT:
+You are the CHRONOS_ARCHITECT. Your goal is to decompose a MISSION_OBJECTIVE into a sequence of 5-7 actionable steps while assigning the most efficient tool for each.
+AVAILABLE TOOLS:
+- "web_search": Use for current data, market trends, or external facts.
+- "code_execution": Use for math, data analysis, or complex logic.
+TIME CONSTRAINTS:
+- Current Budget: {total_time}s.
+- Strategy Window: {get_strategy_time(total_time)}.
+- If Time < 10% of budget: Force immediate "complete".
+STRICT JSON OUTPUT ONLY:
 {{
+  "objective": "{task}",
+  "total_budget": {total_time},
   "steps": [
-    {{"step": "Step 1 description", "time_allocated": 100}},
-    {{"step": "Step 2 description", "time_allocated": 100}}
-  ]
+    {{
+      "step": "Detailed description of action",
+      "time_allocated": integer,
+      "tool_required": "web_search|code_execution|rag_retrieval|chat",
+      "logic_reasoning": "Explanation for tool choice"
+    }}
+  ],
+  "strategy_recommendation": "Summary of execution approach"
 }}
-Sum of time_allocated must be {total_time}. No prose.
+Sum of time_allocated must be {total_time}s only. No prose.
 <</SYS>>
 MISSION_OBJECTIVE: "{task}"
 TOTAL_TEMPORAL_BUDGET: {total_time}
 MODE: {mode}
-STRATEGY_TIME: {get_strategy_time(total_time)}.
 GENERATE_SEQUENCE_NOW: [/INST]"""
 
     try:
@@ -107,7 +118,8 @@ GENERATE_SEQUENCE_NOW: [/INST]"""
             timeout=1800
         )
         if(time.perf_counter() - start_request) > 60:
-            logger.warning("LLM response exceeded SLA performance window.")        
+            logger.warning("LLM response exceeded SLA performance window.")
+                    
 
         result = response.json()
         content = result.get("response", "")
