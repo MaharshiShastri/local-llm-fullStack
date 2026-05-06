@@ -69,7 +69,9 @@ class TaskStep(Base):
     status = Column(String, default="pending")  # Individual step's current status
     artifact_content = Column(Text, nullable=True) # The content and detail about the step
     actual_duration = Column(Float, nullable=True) # Real time taken required to complete the step(useful for future reference to AI and dev)
-
+    tool_required = Column(String)
+    logic_reasoning = Column(String, nullable=True)
+    
 class Document(Base):
     __tablename__ = "documents"
     id = Column(Integer, primary_key=True, index=True)
