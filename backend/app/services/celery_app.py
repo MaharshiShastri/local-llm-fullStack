@@ -1,11 +1,14 @@
 from celery import Celery
 import os
 from kombu import Queue
+import redis
 
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6373/0")
+r_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 celery = Celery(
     "chronos_tasks",
-    broker=os.getenv("REDIS_URL", "redis://localhost:6373/0"),
-    backend = os.getenv("REDIS_URL", "redis://localhost:6373/0")
+    broker=REDIS_URL,
+    backend = REDIS_URL
 )
 
 celery.conf.update(
@@ -15,8 +18,9 @@ celery.conf.update(
         Queue("plan_queue", routing_key="plan.#"),
     ),
     task_routes = {
-        "app.services.tasks.process_chat": {"queue": "chat_queue"},
-        "app.services.tasks.process_plan": {"queue": "plan_queue"},
+        "mission.process_chat": {"queue": "chat_queue"},
+        "mission.process_plan": {"queue": "plan_queue"},
+        "mission.execute_lifecycle": {"queue": "plan_queue"},
     },
     worker_prefetch_multiplier=1,
     task_track_started = True,

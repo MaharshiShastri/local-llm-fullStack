@@ -1,7 +1,42 @@
 import asyncio
-from .celery_app import celery
+from .celery_app import celery, r_client
 from .executor import MissionExecutor
 from app.services.optimizer import TimeOptimizer
+from app.services.ai_service import generate_plan, generate_stream
+from app.services.chat_service import save_message
+from database import SessionLocal
+
+@celery.task(name="mission.process_chat")
+def process_chat_task(conversation_id, prompt):
+    full_response = ""
+    token_channel = f"chat_response_{conversation_id}"
+    
+    try:
+        for token in generate_stream(prompt):
+            full_response += token
+            #Publish the token to redis
+            r_client.publish(token_channel, token)
+        #Done signal            
+        r_client.publish(token_channel, "[DONE]")
+        
+        with SessionLocal() as db:
+            save_message(db, conversation_id, "AI", full_response)
+        
+        return full_response
+    except Exception as e:
+        print(f"Error in tasks.py: {str(e)}")
+        return {"status": "error", "message": str(e)}
+@celery.task(name="mission.process_plan")
+def process_plan_task(task_description, budget):
+    plan = generate_plan(task_description, budget, "fast", "")
+    full_plan = []
+
+    for step in plan:
+        if "error" in plan:
+            return {"status": "error", "message": step["error"]}
+        full_plan.append(step)
+    
+    return full_plan
 
 @celery.task(bind=True, name="mission.execute_lifecycle")
 def execute_mission_task(self, mission_id, total_budget, manifest):
