@@ -25,7 +25,7 @@ from app.rag.ingestor import ingest_text, get_grounded_context
 from app.services.memory_service import get_memories, add_memory, delete_memory, update_memory, extract_and_save_memories
 from app.utils.analytics import analytics_engine
 from app.services.task_service import trigger_mission_execution
-from app.services.tasks import celery
+from app.services.tasks import celery, r_client
 
 api_router = APIRouter()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
@@ -312,40 +312,31 @@ async def chat_stream(request: ChatRequest, db: Session = Depends(get_db), curre
     
     # 6. Construct Final Prompt (Unified Context)
     # We use doc_context here which contains the actual text from your PDF chunks
-    full_prompt = f"""<|system|>
-You are a specialized AI collaborator. Answer using the provided context.
-If the information is not in the context, use your general knowledge but mention it.
-Always cite your sources using [Filename] format.
-
-{doc_context}
-{memory_context}
-{mission_context}
---- RECENT CONVERSATION ---
-{history[-5:]}
-
-<|user|>
-{request.message}
-<|assistant|>"""
-
-    print(f"Full prompt sent to model:\n{full_prompt}\n--- END OF PROMPT ---")
+    celery.send_task("mission.process_chat", args=[conv_id, f"{mission_context}\n{memory_context}\n{doc_context}\n{history}\nUser: {request.message}"])
 
     async def stream_generator():
-        loop = asyncio.get_event_loop()
-        ai_response = ""
+        pubsub = r_client.pubsub()
+        channel = f"chat_stream_{request.conversation_id}"
+        pubsub.subscribe(channel)
         try:
-            yield f"data: {json.dumps({'conversation_id': conv_id})}\n\n"
-            gen = await loop.run_in_executor(executor, lambda: generate_stream(full_prompt))
-            for token in gen:
-                ai_response += token
-                yield f"data: {json.dumps({'token': token})}\n\n"
+            while True:
+                message = pubsub.get_message(ignore_subscribe_messages = True)
 
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                if message:
+                    raw_data = message['data']
+                    if isinstance(raw_data, bytes):
+                        raw_data = raw_data.decode('utf-8')
+                    
+                    if raw_data == b"[DONE]":
+                        break
+                    yield f'data: {{"token": "{raw_data}"}}\n\n'
+                
+                await asyncio.sleep(0.005)
+
         finally:
-            chat_service.save_message(db, conv_id, "AI", ai_response)
-            # Ingest for future turns AFTER the response is generated
-            bg_tasks.add_task(ingest_text, db, f"Conversation {conv_id}", request.message, current_user.id, "conversation")
-
+            pubsub.unsubscribe(channel)
+            pubsub.close()
+            
     return StreamingResponse(stream_generator(), media_type="text/event-stream")
 #Read of web-quivalent method
 @api_router.get('/conversations')
