@@ -4,12 +4,13 @@ from app.rag.chunker import rag_chunker
 from app.rag.vector_store import rag_vector_store
 from app.rag.embedder import rag_embedder
 
-def ingest_text(db: Session, title: str, raw_text: str, user_id: int, source_type: str = "document"):
+def ingest_text(db: Session, title: str, raw_text: str, user_id: int, source_type: str = "document", file_path: str = None):
+    final_path = file_path if file_path else f"/{user_id}/internal/{source_type}"
     #Generalized ETL for any text content (Tasks, Conversations, or PDFs).
     new_doc = Document(
-        filename=f"[{source_type.upper()}] {title}", 
+        filename=title, 
         user_id=user_id, 
-        file_path="DB_INTERNAL"
+        file_path=final_path
         )
     db.add(new_doc)
     db.commit()

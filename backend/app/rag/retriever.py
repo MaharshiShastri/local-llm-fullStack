@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 from sentence_transformers import CrossEncoder
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+import torch
 
 from app.rag.embedder import rag_embedder
 from app.rag.vector_store import rag_vector_store
@@ -11,22 +12,49 @@ from app.models.models import DocumentChunk, Document
 
 class Retriever:
     _instance = None
-    
+    _initialized = False
+
     def __new__(cls, *args, **kwargs):
         if not cls._instance:
             cls._instance = super(Retriever, cls).__new__(cls)
         return cls._instance
     
     def __init__(self, k=15, final_k=3, time_threshold_ms=300):
+        if self._initialized:
+            return
+        self._initialized = True
         self.k = k
         self.final_k = final_k
         self.time_threshold_ms = time_threshold_ms  # SLA for retrieval
-        
-        # Models
-        self.rerank_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-        self.summarizer_tokenizer = AutoTokenizer.from_pretrained('t5-small')
-        self.summarizer_model = AutoModelForSeq2SeqLM.from_pretrained('t5-small')
+        self._rerank_model = None 
+        self._summarizer_model = None
+        self._summarizer_tokenizer = None
+        print(f"--- RAG: Retriever initialized in Lean-Mode (Cloud Summary) ---")
+    
+    @property
+    def reranker(self):
+        """Loads reranker to CPU only when a specific query triggers it."""
+        if self._rerank_model is None:
+            from sentence_transformers import CrossEncoder
+            # Forced to CPU to ensure no conflict with Ollama/Ollama doesn't fight for VRAM
+            self._rerank_model = CrossEncoder("./models/ms-marco-MiniLM-L-6-v2", device="cpu")
+        return self._rerank_model
+    
+    @property
+    def summarizer_model(self):
+        if self._summarizer_model is None:
+            print(f"--- RAG: Loading T5 Model to {self.device} ---")
+            from transformers import AutoModelForSeq2SeqLM
+            self._summarizer_model = AutoModelForSeq2SeqLM.from_pretrained("./models/t5-small").to(self.device)
+        return self._summarizer_model
 
+    @property
+    def summarizer_tokenizer(self):
+        if self._summarizer_tokenizer is None:
+            from transformers import AutoTokenizer
+            self._summarizer_tokenizer = AutoTokenizer.from_pretrained("./models/t5-small")
+        return self._summarizer_tokenizer
+    
     def _normalize_distances(self, distances):
         """
         Converts L2 distances to a 0-1 similarity score.
@@ -36,12 +64,18 @@ class Retriever:
 
     def retrieve_context(self, query: str, db: Session, bypass_summarization=False, load: float = 76.0, total_time: int = 500):
         STRICT_THRESHOLD = 0.5
+        gpu_util = torch.cuda.utilization()
+        vram_used = torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory
+        print("CPU load: ", load, "GPU load: ", gpu_util, "VRAM used: ", round(vram_used *100), "%")
+        
         if total_time < 300:
+            print(total_time)
             self.final_k = 1
             bypass_summarization = True
         else:
             self.final_k = 3
-            bypass_summarization = load > 75.0
+            bypass_summarization = gpu_util > 90.0 or vram_used > 0.9 or load > 75.0
+
         start_time = time.perf_counter()
         
         # 1. FAISS Search
@@ -126,14 +160,14 @@ class Retriever:
         
         prompts = [f"summarize: {b}" for b in bodies]
         
-        inputs = self.summarizer_tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+        inputs = self.summarizer_tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(self.device)
         
         summary_ids = self.summarizer_model.generate(
-            inputs["input_ids"], 
-            max_length=80, 
-            num_beams=2, # Reduced beams for speed
-            early_stopping=True
-        )
+                      inputs["input_ids"], 
+                      max_length=80, 
+                      num_beams=2, 
+                      early_stopping=True
+                    )
         
         summaries = self.summarizer_tokenizer.batch_decode(summary_ids, skip_special_tokens=True)
         return [f"{h}{s}" for h, s in zip(headers, summaries)]
