@@ -25,7 +25,7 @@ from app.rag.ingestor import ingest_text, get_grounded_context
 from app.services.memory_service import get_memories, add_memory, delete_memory, update_memory, extract_and_save_memories
 from app.utils.analytics import analytics_engine
 from app.services.task_service import trigger_mission_execution
-from app.services.tasks import celery, r_client
+from app.services.tasks import celery, r_client, process_chat_task, process_plan_task
 
 api_router = APIRouter()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
@@ -45,7 +45,7 @@ def get_db():
         db.close()
 
 
-r_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+r_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6373/0"))
 
 def get_rag_context(query: str, db: Session, time: int):
     try:
@@ -312,25 +312,29 @@ async def chat_stream(request: ChatRequest, db: Session = Depends(get_db), curre
     
     # 6. Construct Final Prompt (Unified Context)
     # We use doc_context here which contains the actual text from your PDF chunks
-    celery.send_task("mission.process_chat", args=[conv_id, f"{mission_context}\n{memory_context}\n{doc_context}\n{history}\nUser: {request.message}"])
+   
+    process_chat_task.delay(conv_id, f"{mission_context}\n{memory_context}\n{doc_context}\n{history}\nUser: {request.message}")
 
     async def stream_generator():
         pubsub = r_client.pubsub()
-        channel = f"chat_stream_{request.conversation_id}"
+        channel = f"chat_stream_{conv_id}"
+        print("Listening to Redis channel: ", channel)
         pubsub.subscribe(channel)
         try:
             while True:
                 message = pubsub.get_message(ignore_subscribe_messages = True)
-
-                if message:
-                    raw_data = message['data']
-                    if isinstance(raw_data, bytes):
-                        raw_data = raw_data.decode('utf-8')
+                 
+                if message is not None:
                     
-                    if raw_data == b"[DONE]":
+                    print("Type of message['data']:", type(message['data']))   
+                    token = message['data']
+                    
+                    if token == b'[DONE]'or token == '[DONE]':
                         break
-                    yield f'data: {{"token": "{raw_data}"}}\n\n'
-                
+
+                    if isinstance(token, bytes):
+                        token = token.decode('utf-8')
+                    yield f"data: {json.dumps({'payload': token})}\n\n"                
                 await asyncio.sleep(0.005)
 
         finally:
@@ -414,9 +418,6 @@ def delete_task(task_id: int, db: Session = Depends(get_db), current_user: model
 #Create function of web-equivalent method
 @api_router.post("/plan")
 async def create_execution_plan(request: PlanRequest, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    raw_steps = []
-    cpu_usage = psutil.cpu_percent()
-    ram_usage = psutil.virtual_memory().percent
     
     try:
         validate_input(request.task)
@@ -425,9 +426,6 @@ async def create_execution_plan(request: PlanRequest, db: Session = Depends(get_
             status_code=403, 
             content=classify_failure("UNAUTHORIZED_ACCESS", detail=str(e.detail))
         )
-    
-    if cpu_usage > 90 or ram_usage > 95:
-        return JSONResponse(status_code=503, content=classify_failure("RESOURCE_STARTVATION", f"CPU: {cpu_usage}%, RAM: {ram_usage}%"))
     
     async def validate_and_correct_steps(steps, total_budget):
         if len(steps) < 5:
@@ -455,53 +453,38 @@ async def create_execution_plan(request: PlanRequest, db: Session = Depends(get_
     
     context = get_rag_context(request.task, db, time=request.time_budget)
     
-    try:
-        raw_output = await generate_plan(request.task, request.time_budget, request.mode, context)
-        import inspect
-        if inspect.isgenerator(raw_output) or inspect.isasyncgen(raw_output):
-            raw_steps = [step for step in raw_output]
-        elif isinstance(raw_output, str):
-            from app.services.executor import safe_json_parse
-            # Ensure safe_json_parse is awaited if it's async!
-            parsed_data = await safe_json_parse(raw_output, {"steps":[]})
-            raw_steps = parsed_data.get('steps', [])
-        else:
-            raw_steps = raw_output
+    process_plan_task.delay(request.task, request.time_budget, request.mode, current_user.id, context)
 
-        # Add a check to ensure we didn't get a nested list or malformed data
-        if raw_steps and isinstance(raw_steps[0], list):
-             raw_steps = raw_steps[0]
-
-    except Exception as e:
-        logger.error(f"Plan generation crash: {e}")
-        return JSONResponse(status_code=500, content=classify_failure("PLAN_GEN_FAILED", str(e)))
-
-    if not raw_steps:
-        return JSONResponse(status_code=400, content=classify_failure("PLAN_GEN_FAILED", "Generator returned empty sequence."))
-    
-    raw_steps = await validate_and_correct_steps(raw_steps, request.time_budget)
-    # 2. SAVE TO DB (Now we have the full list)
-    mission_id, enriched = task_service.create_mission_and_steps(
-        db, current_user.id, request.task, request.time_budget, raw_steps
-    )
-    ingest_text(db, title=f"Task {mission_id}", raw_text = request.task, user_id=current_user.id, source_type="task") #Ingest the task description into RAG system for future retrieval
-    # 3. STREAM THE RESULTS TO UI
     async def plan_generator():
+        pubsub = r_client.pubsub()
+        channel = f"plan_result_{current_user.id}"
+        print("Listening to Redis channel for plan results: ", channel)
+        pubsub.subscribe(channel)
         try:
-            # First, stream the steps for the "Loading" UI one by one
-            for step_object in raw_steps:
-                print(f"Streaming step: {step_object}")  # Debug log to see the step being streamed
-                yield f"data: {json.dumps({'single_step': step_object, 'status': 'streaming'})}\n\n"
-                await asyncio.sleep(0.1) # Tiny delay so the UI animation looks smooth
+            yield f"data: {json.dumps({'status': 'initializing', 'message': 'Generating mission strategy...'})}\n\n"
+            start_wait = time.time()
+            while True:
+                message =pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if message is not None:
+                    data = message['data']
+                    if isinstance(data, bytes):
+                        data = data.decode('utf-8')
+                    
+                    # This is the final JSON payload from the worker
+                    yield f"data: {data}\n\n"
+                    break # We received the plan, we can close the stream
                 
-            # Finally, send the completion signal with the mission_id
-            yield f"data: {json.dumps({
-                'mission_id': mission_id, 
-                'enriched_steps': enriched, 
-                'status': 'complete'
-            })}\n\n"
+                # Safety timeout (60 seconds)
+                if time.time() - start_wait > 60:
+                    yield f"data: {json.dumps({'status': 'error', 'message': 'Plan generation timed out'})}\n\n"
+                    break
+                    
+                await asyncio.sleep(0.1)
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        finally:
+            pubsub.unsubscribe(channel)
+            pubsub.close()
 
     return StreamingResponse(plan_generator(), media_type="text/event-stream")
 
@@ -564,16 +547,31 @@ async def start_execution(mission_id: int, db: Session = Depends(get_db), curren
 @api_router.get("execute/status/{task_id}")
 async def get_mission_status(task_id: str):
     task_result = celery.AsyncResult(task_id)
-    response = {
+    progress_data = task_result.info if isinstance(task_result.info, dict) else {"message": str(task_result.info)}
+    
+    return {
         "task_id": task_id,
-        "state": task_result.state, # PENDING, PROGRESS, SUCCESS, FAILURE
-        "progress": task_result.info if task_result.info else {}
+        "state": task_result.state, 
+        "data": progress_data
     }
 
     return response
 @api_router.patch("/execute/{mission_id}/approve")
 async def approve_mission_step(mission_id: int, data: StepApprovalRequest, db: Session = Depends(get_db)):
     step_id = str(data.step_id)
+    state_key = f"mission_state:{mission_id}"
+    r_client.hset(state_key, f"{step_id}_status", data.status)
+    
+    def sync_db_approval(db, mission_id, step_id, data):
+        step_db = db.query(models.TaskStep).filter(
+            models.TaskStep.task_id == mission_id,
+            models.TaskStep.backend_step_id == step_id
+        ).first()
+        if step_db:
+            step_db.status = data.status
+            if data.description:
+                step_db.description = data.description
+            db.commit()
 
     try:
         validate_input(data.description)
@@ -582,34 +580,17 @@ async def approve_mission_step(mission_id: int, data: StepApprovalRequest, db: S
         status_code=403, 
         content=classify_failure("UNAUTHORIZED_ACCESS", detail=str(e.detail))
     )
+    if data.description:
+        r_client.hset(state_key, f"{step_id}_desc", data.description)
+    
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(executor, lambda: sync_db_approval(db, mission_id, step_id, data))
 
-    # 1. Update the LIVE manifest in memory first
-    if mission_id in ACTIVE_MISSIONS:
-        manifest = ACTIVE_MISSIONS[mission_id]
-        # Find the specific step in the memory list
-        step_in_memory = next((s for s in manifest if str(s.get('backend_step_id')) == step_id), None)
-        
-        if step_in_memory:
-            step_in_memory['status'] = data.status
-            if data.description:
-                step_in_memory['description'] = data.description
-            
-            # 2. ALSO update DB in background so the state is persisted 
-            # if the user refreshes the page
-            step_db = db.query(models.TaskStep).filter(
-                models.TaskStep.task_id == mission_id,
-                models.TaskStep.backend_step_id == step_id
-            ).first()
-            
-            if step_db:
-                step_db.status = data.status
-                if data.description:
-                    step_db.description = data.description
-                db.commit()
-            r_client.publish(f"mission_control_{mission_id}", "RESUME")
-            return {"message": "Memory updated, stream will proceed."}
-        
-    raise HTTPException(status_code=404, detail="Mission not currently active in memory")
+    approval_channel = f"mission_approval_{mission_id}"
+    payload = json.dumps({"action": "RESUME", "step_id": data.step_id})
+    r_client.publish(approval_channel, payload)
+
+    return {"status": "Step Approved", "mission_id": mission_id}
 
 #Kill switch for the Agentic ai
 @api_router.post("/execute/cancel/{task_id}")
