@@ -8,6 +8,32 @@ from app.services.optimizer import TimeOptimizer
 from app.services.ai_service import generate_stream
 from app.services.chat_service import save_message
 
+def validate_and_correct_steps(steps, total_budget):
+    """Guardrail: Ensures the plan is neither too long nor too short and stays in budget."""
+    if len(steps) < 5:
+        while len(steps) < 5:
+            steps.append({
+                "step": "Additional validation and project review", 
+                "time_allocated": 0,
+                "tool_required": "logic"
+            })
+    elif len(steps) > 7:
+        steps = steps[:7]
+    
+    for s in steps:
+        if s.get("time_allocated", 0) <= 0:
+            s["time_allocated"] = total_budget // len(steps)
+
+    actual_sum = sum(step.get("time_allocated", 0) for step in steps)
+
+    if actual_sum > total_budget:
+        ratio = total_budget / actual_sum
+        for s in steps:
+            # max(10, ...) ensures no step is less than 10 mins
+            s["time_allocated"] = max(10, int(s["time_allocated"] * ratio))
+
+    return steps
+
 @celery.task(name="mission.process_chat")
 def process_chat_task(conversation_id, prompt):
     full_response = ""
@@ -37,12 +63,12 @@ def process_plan_task(task_description, budget, mode, user_id, context):
     from app.models import models
     try:
         raw_steps = generate_plan(task_description, budget, mode, context)
-        
+        steps = validate_and_correct_steps(raw_steps, budget)
         with SessionLocal() as db:
             user = db.query(models.User).filter(models.User.id == user_id).first()
             if not user:
                 return {"status": "error", "message": "User not found"}
-            mission_id, enriched = create_mission_and_steps(db, user_id, task_description, budget, raw_steps)
+            mission_id, enriched = create_mission_and_steps(db, user_id, task_description, budget, steps)
             ingest_text(db, title=f"Task {mission_id}", raw_text=task_description, user_id=user_id, source_type="task")
             result_channel = f"plan_result_{user_id}"
             payload = {
@@ -101,7 +127,12 @@ async def run_mission_loop(task, executor, manifest, total_budget):
 
         # 4. Execution with Retries[cite: 24]
         result = await executor.run_step_with_retries(step, strategy)
-        
+        if result == "FAILED_BUT_CONTINUING":
+            task.update_state(state='PROGRESS', meta={
+                'event': 'STEP_FAILED',
+                'index': i,
+                'step_id': step['backend_step_id']
+            })
         # 5. Success/Telemetry Pulse[cite: 25]
         task.update_state(state='PROGRESS', meta={
             'event': 'STEP_COMPLETED',

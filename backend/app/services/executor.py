@@ -1,12 +1,14 @@
 import asyncio
 import time
 import logging
-from app.services.browser_agent import browser_agent
-from app.services.code_executor import executor
 import redis
 import os
 import json
 
+from app.services.browser_agent import browser_agent
+from app.services.code_executor import executor
+from database import SessionLocal
+from app.models import models
 logger = logging.getLogger(__name__)
 
 class MissionExecutor:
@@ -35,7 +37,10 @@ class MissionExecutor:
         
         while True:
             message = pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-            if message and message['data'].decode('utf-8') == "RESUME":
+            if message:
+                data = json.loads(message['data'].decode('utf-8'))
+                if data.get("action") == "RESUME" and str(data.get("step_id")) == str(step_id):
+                   break
                 logger.info(f"Resume signal received for mission {self.mission_id}")
                 break
             await asyncio.sleep(1)
@@ -44,7 +49,7 @@ class MissionExecutor:
     async def perform_task(self, tool, step_data):
         try:
             if tool == "web_search":
-                tool_output = await browser_agent.search_and_summarize(step_data)
+                tool_output = await browser_agent.search_and_summarize(step_data["instruction"])
             elif tool == "code_execution":
                 tool_output = await executor.execute_python(step_data)
             else:
@@ -72,6 +77,14 @@ class MissionExecutor:
 
                 # Success Telemetry: You could log success latency here if needed
                 self.step_context[step_id] = result
+                with SessionLocal() as db:
+                    db_step = db.query(models.TaskStep).filter(
+                              models.TaskStep.backend_step_id == step_id
+                            ).first()
+                    if db_step:
+                        db_step.status = "completed" if result != "FAILED_BUT_CONTINUING" else "failed"
+                        db_step.artifact_content = str(result) # Save the tool's findings
+                        db.commit()
                 return result
 
             except Exception as e:
