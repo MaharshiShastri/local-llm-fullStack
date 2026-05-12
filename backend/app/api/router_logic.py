@@ -544,7 +544,7 @@ async def start_execution(mission_id: int, db: Session = Depends(get_db), curren
         "message": "Mission execution moved to background worker."
     }
 
-@api_router.get("execute/status/{task_id}")
+@api_router.get("/execute/status/{task_id}")
 async def get_mission_status(task_id: str):
     task_result = celery.AsyncResult(task_id)
     progress_data = task_result.info if isinstance(task_result.info, dict) else {"message": str(task_result.info)}
@@ -555,7 +555,6 @@ async def get_mission_status(task_id: str):
         "data": progress_data
     }
 
-    return response
 @api_router.patch("/execute/{mission_id}/approve")
 async def approve_mission_step(mission_id: int, data: StepApprovalRequest, db: Session = Depends(get_db)):
     step_id = str(data.step_id)
@@ -586,7 +585,7 @@ async def approve_mission_step(mission_id: int, data: StepApprovalRequest, db: S
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(executor, lambda: sync_db_approval(db, mission_id, step_id, data))
 
-    approval_channel = f"mission_approval_{mission_id}"
+    approval_channel = f"mission_control_{mission_id}"
     payload = json.dumps({"action": "RESUME", "step_id": data.step_id})
     r_client.publish(approval_channel, payload)
 
