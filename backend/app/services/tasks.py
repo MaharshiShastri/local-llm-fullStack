@@ -1,16 +1,18 @@
 import asyncio
+import json
+
+from database import SessionLocal
 from .celery_app import celery, r_client
 from .executor import MissionExecutor
 from app.services.optimizer import TimeOptimizer
-from app.services.ai_service import generate_plan, generate_stream
+from app.services.ai_service import generate_stream
 from app.services.chat_service import save_message
-from database import SessionLocal
 
 @celery.task(name="mission.process_chat")
 def process_chat_task(conversation_id, prompt):
     full_response = ""
-    token_channel = f"chat_response_{conversation_id}"
-    
+    token_channel = f"chat_stream_{conversation_id}"
+    print(f"Streaming on Redis channel: {token_channel}")
     try:
         for token in generate_stream(prompt):
             full_response += token
@@ -26,17 +28,38 @@ def process_chat_task(conversation_id, prompt):
     except Exception as e:
         print(f"Error in tasks.py: {str(e)}")
         return {"status": "error", "message": str(e)}
-@celery.task(name="mission.process_plan")
-def process_plan_task(task_description, budget):
-    plan = generate_plan(task_description, budget, "fast", "")
-    full_plan = []
-
-    for step in plan:
-        if "error" in plan:
-            return {"status": "error", "message": step["error"]}
-        full_plan.append(step)
     
-    return full_plan
+@celery.task(name="mission.process_plan")
+def process_plan_task(task_description, budget, mode, user_id, context):
+    from app.services.ai_service import generate_plan
+    from app.services.task_service import create_mission_and_steps # Local import
+    from app.rag.ingestor import ingest_text
+    from app.models import models
+    try:
+        raw_steps = generate_plan(task_description, budget, mode, context)
+        
+        with SessionLocal() as db:
+            user = db.query(models.User).filter(models.User.id == user_id).first()
+            if not user:
+                return {"status": "error", "message": "User not found"}
+            mission_id, enriched = create_mission_and_steps(db, user_id, task_description, budget, raw_steps)
+            ingest_text(db, title=f"Task {mission_id}", raw_text=task_description, user_id=user_id, source_type="task")
+            result_channel = f"plan_result_{user_id}"
+            payload = {
+                "status": "complete",
+                "mission_id": mission_id,
+                "enriched_steps": enriched
+            }
+            print(f"Mission {mission_id} created with {len(enriched)} enriched steps.")
+            print(f"Publishing plan result to Redis Channel: {result_channel}")
+            r_client.publish(result_channel, json.dumps(payload))
+            
+        return {"status": "success", "mission_id": mission_id}
+    except Exception as e:
+        error_payload = {"status":"error", "message": str(e)}       
+        
+        r_client.publish(f"plan_result_{user_id}", json.dumps(error_payload))
+        return error_payload
 
 @celery.task(bind=True, name="mission.execute_lifecycle")
 def execute_mission_task(self, mission_id, total_budget, manifest):

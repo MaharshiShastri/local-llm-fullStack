@@ -34,7 +34,7 @@ class MissionExecutor:
         logger.info(f"Step {step_id} suspended. Waiting for signal on {channel}...")
         
         while True:
-            message = pubsub.get_message(ignore_subscribe_messages=True)
+            message = pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
             if message and message['data'].decode('utf-8') == "RESUME":
                 logger.info(f"Resume signal received for mission {self.mission_id}")
                 break
@@ -44,7 +44,7 @@ class MissionExecutor:
     async def perform_task(self, tool, step_data):
         try:
             if tool == "web_search":
-                tool_output = await browser_agent.run(step_data)
+                tool_output = await browser_agent.search_and_summarize(step_data)
             elif tool == "code_execution":
                 tool_output = await executor.execute_python(step_data)
             else:

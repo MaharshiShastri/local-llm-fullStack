@@ -13,7 +13,7 @@ celery = Celery(
 
 celery.conf.update(
     task_default_queue="default",
-    task_Queues=(
+    task_queues=(
         Queue("chat_queue", routing_key="chat.#"),
         Queue("plan_queue", routing_key="plan.#"),
     ),
@@ -29,5 +29,11 @@ celery.conf.update(
     task_track_started=True,
     task_serialization="json",
     result_persistent=True,
-    worker_prefetch_multiplier = 1
+    worker_prefetch_multiplier = 1,
+
+    result_expires = 3600
 )
+
+import logging
+logger = logging.getLogger(__name__)
+logger.info(f"--- Chronos Celery initiated on {REDIS_URL} ---")

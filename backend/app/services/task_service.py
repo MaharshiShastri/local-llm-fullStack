@@ -3,7 +3,7 @@ import json
 import uuid
 from sqlalchemy.orm import Session
 from app.models import models
-from .tasks import execute_mission_task
+
 
 def clean_and_parse_plan(raw_text: str):
     try:
@@ -68,6 +68,7 @@ def create_mission_and_steps(db: Session, user_id: int, task_title: str, budget:
     return mission.id, enriched_steps
 
 def trigger_mission_execution(db: Session, mission_id: int, budget: int, enriched_steps: list):
+    from .tasks import execute_mission_task
     task = execute_mission_task.delay(mission_id, budget, enriched_steps)
 
     mission = db.query(models.Tasks).filter(models.Tasks.id == mission_id).first()
