@@ -116,7 +116,12 @@ https://github.com/user-attachments/assets/39f46ce2-95d2-4b98-8a98-f4048687d12d
 
 https://github.com/user-attachments/assets/99e635e3-9738-4f43-9bc2-a441ad64abfd
 
+### Current work update(13 May, 2026)
 
+
+https://github.com/user-attachments/assets/c62c34cf-e494-4bff-b0ff-9fb3c00b0398
+
+Note: Work is still under progress and nearly completed(need to work on agentic logic and front-end integration)
 
 This demonstrates:
 - Authentication flow  
