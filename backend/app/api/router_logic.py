@@ -45,7 +45,7 @@ def get_db():
         db.close()
 
 
-r_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6373/0"))
+r_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
 
 def get_rag_context(query: str, db: Session, time: int):
     try:
@@ -173,64 +173,6 @@ def login(request: UserAuth, db: Session = Depends(get_db)):
     return ({"access_token": access_token, "token_type": "bearer", "user": {"id": user.id,  "email": user.email}})
 
 #START of Ordinary conversations with AI functions below for web-equivalent CRUD operations
-#Update the conversation with new prompt from user(buffererd response used for very initial testing)
-"""
-@api_router.post("/chat")
-def chat(request: ChatRequest, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    #Check if the conversation is presnet, if not then create a new one
-    if request.conversation_id:
-        conversation = db.query(models.Conversation).filter(
-            models.Conversation.id == request.conversation_id
-            ).first()
-    else:
-        conversation = models.Conversation(user_id=current_user.id)
-        db.add(conversation)
-        db.commit()
-        db.refresh(conversation)
-    
-    try:
-        validate_input(request.message)
-    except Exception as e:
-        return JSONResponse(
-            status_code=403, 
-            content=classify_failure("UNAUTHORIZED_ACCESS", detail=str(e.detail))
-        )
-
-        #Save user message
-    user_msg = models.Message(
-        conversation_id = conversation.id,
-        role="User",
-        content = request.message
-    )
-
-    db.add(user_msg)
-    messages = db.query(models.Message).filter(
-    models.Message.conversation_id == conversation.id
-).order_by(models.Message.timestamp.desc()).limit(6).all()
-    history_text = ""
-
-    for msg in messages:
-        if msg.role == "user":
-            history_text += f"User: {msg.content}\n"
-        else:
-            history_text += f"AI: {msg.content}\n"
-
-    full_prompt = history_text + f"User: {request.message}\nAssistant:"
-    #GEnerate AI reply
-    #ai_reply = await queued_llm(generate_response, full_prompt)
-    #ai_reply = generate_response(full_prompt)
-
-    #Save AI reply
-    ai_msg = models.Message(
-        conversation_id = conversation.id,
-        role="LLM",
-        content = ai_reply
-    )
-
-    db.add(ai_msg)
-    db.commit()
-
-    return {"response": ai_reply, "conversation_id": conversation.id}"""
 
 #Read opearation of web-equivalent(GET) for all conversations
 @api_router.get("/conversation/{conversation_id}")
@@ -284,36 +226,14 @@ async def chat_stream(request: ChatRequest, db: Session = Depends(get_db), curre
             status_code=403, 
             content=classify_failure("UNAUTHORIZED_ACCESS", detail=str(e.detail))
         )
-    
-    # 2. RETRIEVE CONTEXT 
-    # Use the retriever as the single source for RAG context
-    try:
-        doc_context = get_rag_context(request.message, db, time=50000)
-        #print(doc_context[:10])
-        if not doc_context and request.message.startswith("@doc"):
-            print(classify_failure("RAG_SILENCE", "Query Explicitly requested docs but not found."))
-        mission_context = get_active_mission_context(current_user.id, db)
-    except Exception as e:
-        return JSONResponse(status_code=500, content=classify_failure("DB_CONTENT", str(e)))
 
     # 3. Save User Message
     chat_service.save_message(db, conv_id, "user", request.message)
     
-    # 4. Get User Memories
-    memories = get_memories(db, current_user.id)
-    memory_context = ""
-    if memories:
-        memory_context = "USER FACTS:\n" + "\n".join(
-            [f"-[{m.category}] {m.fact_key}: {m.fact_value}" for m in memories if m.importance >= 3]
-        )
-        
-    # 5. Build History
-    history = chat_service.build_chat_history(db, conv_id)
-    
     # 6. Construct Final Prompt (Unified Context)
     # We use doc_context here which contains the actual text from your PDF chunks
    
-    process_chat_task.delay(conv_id, f"{mission_context}\n{memory_context}\n{doc_context}\n{history}\nUser: {request.message}")
+    process_chat_task.delay(conv_id, current_user.id, request.message)
 
     async def stream_generator():
         pubsub = r_client.pubsub()
@@ -425,35 +345,9 @@ async def create_execution_plan(request: PlanRequest, db: Session = Depends(get_
         return JSONResponse(
             status_code=403, 
             content=classify_failure("UNAUTHORIZED_ACCESS", detail=str(e.detail))
-        )
-    
-    async def validate_and_correct_steps(steps, total_budget):
-        if len(steps) < 5:
-            logger.warning(f"Guardrail Trigerred: Only {len(steps)} steps. Padding Plan")
-            while len(steps) < 5:
-                steps.append({"step": "Additional validation and review", "time_allocated": 0})
-        elif len(steps) > 7:
-            logger.warning(f"Guardrail Triggered: {len(steps)} steps. Compressing plan.")
-            steps = steps[:7]
-        
-        for s in steps:
-            if s.get("time_allocated", 0) <= 0:
-                s["time_allocated"] = total_budget // len(steps)
+        )     
 
-        actual_sum = sum(step.get("time_allocated", 0) for step in steps)
-
-        if actual_sum > total_budget:
-            # Scale all steps down proportionally instead of just nuking the last one
-            ratio = total_budget / actual_sum
-            for s in steps:
-                s["time_allocated"] = max(10, int(s["time_allocated"] * ratio))
-
-        return steps
-        
-    
-    context = get_rag_context(request.task, db, time=request.time_budget)
-    
-    process_plan_task.delay(request.task, request.time_budget, request.mode, current_user.id, context)
+    process_plan_task.delay(request.task, request.time_budget, request.mode, current_user.id)
 
     async def plan_generator():
         pubsub = r_client.pubsub()
@@ -465,6 +359,7 @@ async def create_execution_plan(request: PlanRequest, db: Session = Depends(get_
             start_wait = time.time()
             while True:
                 message =pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                print(message)
                 if message is not None:
                     data = message['data']
                     if isinstance(data, bytes):
@@ -475,7 +370,7 @@ async def create_execution_plan(request: PlanRequest, db: Session = Depends(get_
                     break # We received the plan, we can close the stream
                 
                 # Safety timeout (60 seconds)
-                if time.time() - start_wait > 60:
+                if time.time() - start_wait > 300:
                     yield f"data: {json.dumps({'status': 'error', 'message': 'Plan generation timed out'})}\n\n"
                     break
                     
