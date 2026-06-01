@@ -8,7 +8,7 @@ class VectorStore:
         self.index_path = index_path
 
         if os.path.exists(self.index_path): #Load the index if it exists
-            self.index = faiss.read_index(self.index_path)
+            self.index = faiss.read_index(self.index_path, faiss.IO_FLAG_MMAP)
             print(f"---\t RAG: Loaded existing FAISS index from {self.index_path} ---")
         else: #Create a new index
             #L2 Distance (Euclidean) is standard for similarity

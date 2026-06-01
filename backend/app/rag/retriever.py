@@ -91,7 +91,7 @@ class Retriever:
         valid_hits = [(idx, sim) for idx, sim in zip(indices, similarities) if idx != -1 and sim > STRICT_THRESHOLD]
         
         if not valid_hits:
-            return ["No direct document matches found. Proceeding with general knowledge."], {"status": "fallback"}
+            return ["No direct document matches found. Proceeding with general knowledge."], {"status": "No valid hits"}
 
         valid_indices = [int(h[0]) for h in valid_hits]
 
@@ -104,7 +104,7 @@ class Retriever:
         )
 
         if not chunks_with_docs:
-            return ["Primary record retrieval failed."], {"status": "error"}
+            return ["Primary record retrieval failed."], {"status": "Could not fetch document data"}
 
         # 4. Re-Ranking (Cross-Encoder)
         pairs = [[query, item[0].content] for item in chunks_with_docs]
