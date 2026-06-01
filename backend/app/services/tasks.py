@@ -1,12 +1,20 @@
 import asyncio
 import json
+import psutil
+import logging
+import json
 
 from database import SessionLocal
 from .celery_app import celery, r_client
 from .executor import MissionExecutor
 from app.services.optimizer import TimeOptimizer
 from app.services.ai_service import generate_stream
-from app.services.chat_service import save_message
+from app.services import chat_service
+from app.models import models
+from app.services.memory_service import get_memories
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 def validate_and_correct_steps(steps, total_budget):
     """Guardrail: Ensures the plan is neither too long nor too short and stays in budget."""
@@ -35,34 +43,73 @@ def validate_and_correct_steps(steps, total_budget):
     return steps
 
 @celery.task(name="mission.process_chat")
-def process_chat_task(conversation_id, prompt):
-    full_response = ""
-    token_channel = f"chat_stream_{conversation_id}"
-    print(f"Streaming on Redis channel: {token_channel}")
+def process_chat_task(conversation_id, user_id, raw_message):
+    db = SessionLocal()
     try:
-        for token in generate_stream(prompt):
-            full_response += token
-            #Publish the token to redis
-            r_client.publish(token_channel, token)
-        #Done signal            
-        r_client.publish(token_channel, "[DONE]")
+        doc_context = ""
+        try:
+            from app.rag.retriever import rag_retriever
+
+            cpu_load = psutil.cpu_percent()
+            result, metrics = rag_retriever.retrieve_context(raw_message, db, load=cpu_load, total_time=50000)
+       
+            if result:
+                metrics["system_cpu"] = cpu_load
+                with open("retrieval_metricss.log", "a") as log_file:
+                    log_file.write(json.dumps(metrics)+"\n")
+                doc_context = f"\n--- RELEVANT DOCUMENTS ---\n" + "\n".join(result)
+
+        except Exception as rag_err:
+            logger.error(f"Celery RAG Execution Failure: {rag_err}")
         
-        with SessionLocal() as db:
-            save_message(db, conversation_id, "AI", full_response)
+        mission_context = ""
+        active_mission = db.query(models.Tasks).filter(
+            models.Tasks.user_id == user_id,
+            models.Tasks.status == "pending"
+        ).first()
+
+        if active_mission:
+            mission_context = f"\n[SYSTEM ALERT: The user has an active mission: '{active_mission.title}']\n"
         
-        return full_response
-    except Exception as e:
-        print(f"Error in tasks.py: {str(e)}")
-        return {"status": "error", "message": str(e)}
+        memories = get_memories(db, user_id)
+        memory_context = ""
+        if memories:
+            memory_context = "USER FACTS:\n" + "\n".join([f"-[{m.catergory}] {m.fact_key}: {m.fact_value}" for m in memories if m.importance >= 3])
+        
+        history = chat_service.build_chat_history(db, conversation_id)
+
+        final_prompt = f"{mission_context}\n{memory_context}\n{doc_context}\n{history}\nUser: {raw_message}\nAssistant:"
+
+        redis_channel = f"chat_stream_{conversation_id}"
+
+        for token in generate_stream(final_prompt):
+            if token:
+                r_client.publish(redis_channel, token)
+
+        r_client.publish(redis_channel, "[DONE]")
+    
+    except Exception as task_err:
+        logger.error(f"Critical Error Processing chat tasak in celery: {task_err}")
+        r_client.publish(f"chat_stream_{conversation_id}", f"[ERROR] {str(task_err)}")
+        r_client.publish(f"chat_stream_{conversation_id}", "[DONE]")
+    
+    finally:
+        db.close()
+
     
 @celery.task(name="mission.process_plan")
-def process_plan_task(task_description, budget, mode, user_id, context):
+def process_plan_task(task_description, budget, mode, user_id):
     from app.services.ai_service import generate_plan
     from app.services.task_service import create_mission_and_steps # Local import
-    from app.rag.ingestor import ingest_text
-    from app.models import models
+    from app.rag.ingestor import ingest_text, get_grounded_context
+    
+
     try:
-        raw_steps = generate_plan(task_description, budget, mode, context)
+        context = ''
+        with SessionLocal() as db:
+            print("Getting context....")
+            context = get_grounded_context(task_description, db, user_id)
+        raw_steps = list(generate_plan(task_description, budget, mode, context))
         steps = validate_and_correct_steps(raw_steps, budget)
         with SessionLocal() as db:
             user = db.query(models.User).filter(models.User.id == user_id).first()

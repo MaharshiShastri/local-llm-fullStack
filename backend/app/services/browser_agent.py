@@ -17,15 +17,15 @@ class BrowserAgent:
 
             try:
                 await page.goto(f"https://duckduckgo.com/?q={query.replace(' ', '+')}")
-                await page.wait_for_selector(".react-results--main")
+                await page.wait_for_selector(".links_main", timeout=10000)
 
                 results = await page.evaluate("""
                     () => {
-                        const items = Array.from(document.querySelectorAll('article')).slice(0, 3);
+                        const items = Array.from(document.querySelectorAll('.result__body')).slice(0, 3);
                         return items.map(item => ({
-                            title: item.innerText,
-                            url: item.querySelector('a')?.href
-                        }));
+                            title: item.querySelector('.result__title')?.innerText || '',
+                            url: item.querySelector('.result__snippet')?.href || item.querySelector('a')?.href || ''
+                    }));
                     }
                 """)
 

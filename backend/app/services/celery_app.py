@@ -3,7 +3,7 @@ import os
 from kombu import Queue
 import redis
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6373/0")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 r_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 celery = Celery(
     "chronos_tasks",
